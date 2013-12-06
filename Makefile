@@ -15,7 +15,7 @@ CFLAGS = -Wall -g
 
 all: $(PROGS)
 
-STPROG = magent.o ketama.o md5.o log.o
+STPROG = dmagent.o ketama.o md5.o log.o
 
 
 log.o: log.c log.h
@@ -27,8 +27,8 @@ md5.o: md5.c md5.h
 ketama.o: ketama.c md5.c ketama.h md5.h
 	$(CC) $(CFLAGS) -c -o $@ ketama.c
 
-magent.o: magent.c ketama.h md5.h
-	$(CC) $(CFLAGS) -c -o $@ magent.c
+dmagent.o: dmagent.c ketama.h md5.h
+	$(CC) $(CFLAGS) -c -o $@ dmagent.c
 
 dmagent: $(STPROG)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS) $(ALLOC_LINK)
