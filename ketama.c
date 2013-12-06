@@ -36,6 +36,8 @@
 #define FAIL -1
 #define ERROR -1
 
+extern int verbose_mode;
+
 char k_error[255] = "";
 
 int total_ktm_numservers; 
@@ -515,8 +517,9 @@ ketama_create_prepare(ketama_continuum kcptr, serverinfo **slist,
         int hpct = floorf( pct * 100.0 );						//整数权重值
         int ks = floorf( pct * 40.0 * (float)numservers );
 
-		fprintf(stderr, "Server no. %d: %s (mem: %ld = %d%% or %d of %d)\n", i, slist[i]->ip,
-			slist[i]->weight, hpct, ks, numservers * 40 );
+		if (verbose_mode)
+			fprintf(stderr, "Server no. %d: %s (mem: %ld = %d%% or %d of %d)\n", i, slist[i]->ip,
+				slist[i]->weight, hpct, ks, numservers * 40 );
 
 		for( k = 0; k < ks; k++ ) {
 			// 40 hashes, 4 numbers per hash = 160 points per server
@@ -574,7 +577,8 @@ int ketama_reset(ketama_continuum *contptr,serverinfo **slist,
 				unsigned int numservers, unsigned long memory)
 {
     if ( numservers < 1 ) {
-		fprintf(stderr, "number of server < 1!\n");
+		if (verbose_mode)
+			fprintf(stderr, "number of server < 1!\n");
         return ERROR;
 	}
 
@@ -605,10 +609,10 @@ int delete_server_node(serverinfo **slist, unsigned int *numservers,
 	for (i = 0; i < total_ktm_numservers; i++) {
 		if (slist[i] == NULL)
 			continue;
-		fprintf(stderr, "delete matched!slistip=[%s],del_ip=[%s]\n", slist[i]->ip, del_ip);
+
 		if (!strncmp(slist[i]->ip, del_ip, IP_LEN)) {
-			//fprintf(stderr, "delete matched!slistip=[%s],del_ip=[%s]\n", slist[i].addr, del_ip);
-			fprintf(stderr, "delete matched ip\n");
+			if (verbose_mode)
+				fprintf(stderr, "delete matched!slistip=[%s],del_ip=[%s]\n", slist[i]->ip, del_ip);
 			del_mem = slist[i]->weight;	
 			/*
 			for (j = i; j < *numservers-1; j++) {
@@ -641,10 +645,10 @@ int add_server_node(serverinfo **slist, unsigned int *numservers,
 
 	for (i = 0; i < total_ktm_numservers; i++) {
 		if (NULL != *(slist+i)) {
-			fprintf(stderr, "i=%d\n", i);
 			continue;
 		}
-		fprintf(stderr, "find empty seat in ktmserver list: %d  add server=[%s]\n", i, sri->ip);
+		if (verbose_mode)
+			fprintf(stderr, "find empty seat in ktmserver list: %d  add server=[%s]\n", i, sri->ip);
 
 		*(slist+i) = sri;
 		add_mem = sri->weight;

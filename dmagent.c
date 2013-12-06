@@ -238,7 +238,8 @@ typedef struct token_s {
 /* static variables */
 static int port = 11211;
 //static unsigned long port = 11211;
-static int maxconns = 4096, curconns = 0, sockfd = -1, verbose_mode = 0; 
+static int maxconns = 4096, curconns = 0, sockfd = -1; 
+int verbose_mode = 0; 
 /* zxh chang to 1 */
 static int use_ketama = 1;
 static struct event ev_master;
@@ -428,10 +429,8 @@ maintain_ketama_srv_thread(void)
     	if (ketama_mantain_signal == 0) { 
     	    /* always hold this lock while we're running */
 			if (verbose_mode)
-				fprintf(stderr, "waiting for cond signal 1111 now!\n");
+				fprintf(stderr, "waiting for cond signal!\n");
     	    r = pthread_cond_wait(&ketama_mantain_cond, &ktm_lock);
-			if(verbose_mode)
-				fprintf(stderr, "waiting for cond signal 2222 now r=%d!\n", r);
     	}
 		//pthread_mutex_unlock(&ktm_lock);
 	}
@@ -475,7 +474,7 @@ maintain_add_srv_thread(void)
 
 			sockfd = socket(AF_INET, SOCK_STREAM, 0); 
 			if (sockfd < 0) {
-				fprintf(stderr, "create socket error:%s\n",strerror(errno));
+				dmlog("create socket error:%s\n",strerror(errno));
 				continue;
 			}
 
@@ -490,7 +489,7 @@ maintain_add_srv_thread(void)
 			if (ps) *ps = '\0';
 			
 			if (inet_pton(AF_INET, ip, &servaddr.sin_addr) < 0) {
-				fprintf(stderr, "inet_pton error: %s\n", strerror(errno));
+				dmlog("inet_pton error: %s\n", strerror(errno));
 				continue;
 			}
 			servlen = sizeof(servaddr);
@@ -504,7 +503,7 @@ maintain_add_srv_thread(void)
 				pthread_mutex_lock(&ktm_lock);
 				ret = add_server_node(ktm_slist, &ktm_numservers, &ktm_memory, psrv);
 				if (FAIL == ret) {
-					fprintf(stderr,"add server:[%s] to ktm_slist error!\n", ip);
+					dmlog("add server:[%s] to ktm_slist error!\n", ip);
 					pthread_mutex_unlock(&ktm_lock);
 					continue;
 				}
@@ -512,7 +511,7 @@ maintain_add_srv_thread(void)
 				//ketama_print_continuum(ktm_kc);
 				if (FAIL == ret) {
 					pthread_mutex_unlock(&ktm_lock);
-					fprintf(stderr, "reset ketama after deleted server :%s error!\n", ip);
+					dmlog("reset ketama after deleted server :%s error!\n", ip);
 					continue;
 				} 
 				psrv->is_alive = TRUE;
@@ -835,7 +834,7 @@ put_server_into_pool(struct server *s)
 	if (m->size == 0) {
 		m->pool = (struct server **) calloc(sizeof(struct server *), STEP);
 		if (m->pool == NULL) {
-			fprintf(stderr, "%s: (%s.%d) out of memory for pool allocation\n", cur_ts_str, __FILE__, __LINE__);
+			dmlog("%s: (%s.%d) out of memory for pool allocation\n", cur_ts_str, __FILE__, __LINE__);
 			m = NULL;
 		} else {
 			m->size = STEP;
@@ -845,7 +844,7 @@ put_server_into_pool(struct server *s)
 		if (m->size < maxidle) {
 			p = (struct server **)realloc(m->pool, sizeof(struct server *)*(m->size + STEP));
 			if (p == NULL) {
-				fprintf(stderr, "%s: (%s.%d) out of memory for pool reallocation\n", cur_ts_str, __FILE__, __LINE__);
+				dmlog("%s: (%s.%d) out of memory for pool reallocation\n", cur_ts_str, __FILE__, __LINE__);
 				m = NULL;
 			} else {
 				m->pool = p;
@@ -1262,7 +1261,7 @@ do_transcation(conn *c)
 	} else {
 		s = (struct server *) calloc(sizeof(struct server), 1);
 		if (s == NULL) {
-			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
+			dmlog("%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			conn_close(c);
 			return;
 		}
@@ -1280,7 +1279,7 @@ do_transcation(conn *c)
 	if (s->sfd <= 0) {
 		s->sfd = socket(AF_INET, SOCK_STREAM, 0); 
 		if (s->sfd < 0) {
-			fprintf(stderr, "%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
+			dmlog("%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
 			return;
 		}
@@ -1299,7 +1298,7 @@ do_transcation(conn *c)
 	if (c->flag.is_get_cmd) {
 		b = buffer_init_size(strlen(key) + 20);
 		if (b == NULL) {
-			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
+			dmlog("%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR OUT OF MEMORY");
 			return;
 		}
@@ -2354,6 +2353,7 @@ static int creat_ktm_slist(struct matrix *m, int nmt)
 
 	ktm_slist = (serverinfo **) calloc(nmt, sizeof(serverinfo *));
 	if (ktm_slist == NULL) {
+		dmlog("out of memory for %s\n", optarg);
 		fprintf(stderr, "out of memory for %s\n", optarg);
 		return FAIL;
 	}
