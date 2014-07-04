@@ -7,7 +7,9 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-
+#include <pthread.h>
+#include <string.h>
+#include <errno.h>
 
 
 #define LOG_EMERG   0   /* system is unusable */
@@ -21,9 +23,21 @@
 
 
 #define DM_MAX_LOGMSG_LEN 1024
-#define DEF_LOG_FILE "dmagent.log"
+#define DEF_LOG_FILE "/tmp/dmagent.log"
+#define BAK_LOG_FILE "/tmp/dmagent1.log"
 
 #define DM_LOG_RAW (1<<10) 
+
+/* log file id */
+#define ERR_LOG_ID -1
+#define DEF_LOG_ID 0
+#define BAK_LOG_ID 1
+
+typedef struct log_man {
+	FILE *fp;
+	char *path;	
+	int fileid;
+}log_man_t;
 
 
 

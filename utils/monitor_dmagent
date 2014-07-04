@@ -1,0 +1,17 @@
+#!/bin/bash
+PROCESS_NAME='/usr/local/bin/dmagent'
+START_DAEMON='dmagentd'
+FREQUENCY=3 #3s
+LOG_PATH='/var/log/monitor_dmagent.log'
+ISEXIST=
+
+#1)SIGHUP  2)SIGINT  3)SIGQUIT 9)SIGKILL  10)SIGUSR1 12)SIGUSR2 24)SIGXCPU
+trap "" 1 2 3 9 10 12 24
+
+while(true)
+do
+  ISEXIST=$(ps -ef | grep $PROCESS_NAME | grep -v 'grep' | wc -l);
+  [ $ISEXIST -eq 0 ] && echo "-------------"$(date +"%Y%m%d %H:%M:%S")"----------" >> ${LOG_PATH}
+  [ $ISEXIST -eq 0 -a -f "/etc/init.d/${START_DAEMON}" ] && /etc/init.d/${START_DAEMON} start >> ${LOG_PATH}
+  sleep "${FREQUENCY}"
+done

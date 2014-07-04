@@ -5,18 +5,19 @@ PROGS =	dmagent
 
 ifeq ($(ARCH), $(X64))
 	M64 = -m64
-	LIBS = /usr/lib64/libevent.a /usr/lib64/libm.a 
-else
-	LIBS = -levent -lm -L/usr/local/lib
 endif
 
-#CFLAGS = -Wall -g -O2 -I/usr/local/include $(M64)
-CFLAGS = -Wall -g 
+LIBS = -levent -lm -L/usr/local/lib -ltcmalloc
+CFLAGS = -Wall -g -O2 $(M64)
+
 
 all: $(PROGS)
 
-STPROG = dmagent.o ketama.o md5.o log.o
+STPROG = dmagent.o ketama.o md5.o log.o queue.c
 
+
+queue.o: queue.c queue.h common.h
+	$(CC) $(CFLAGS) -c -o $@ queue.c
 
 log.o: log.c log.h
 	$(CC) $(CFLAGS) -c -o $@ log.c
@@ -33,6 +34,12 @@ dmagent.o: dmagent.c ketama.h md5.h
 dmagent: $(STPROG)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS) $(ALLOC_LINK)
 
+install:
+	cp $(PROGS) /usr/local/bin/
+	cp ./dmagent.conf /usr/local/etc/
+	cp ./utils/dmagent_init_scripts /etc/init.d/dmagentd
+	cp ./utils/monitor_dmagent /usr/local/bin/
+	cp ./utils/monitor_dmagentd /etc/init.d/
 
 clean:
 	rm -f *.o *~ $(PROGS)

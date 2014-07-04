@@ -1,0 +1,66 @@
+#!/bin/sh
+#
+# Simple dmagent init.d script conceived to work on Linux systems
+# as it does use of the /proc filesystem.
+#
+# command line: ./dmagent -u root -n 51200 -p 11211 -c dmagent.conf
+#
+
+DMAGENT_PORT=11211
+PROG=dmagent
+EXEC=/usr/local/bin/${PROG}
+CONF="/usr/local/etc/${PROG}.conf"
+OPTIONS=" -u root -p ${DMAGENT_PORT} -n 10240 -i 10 "
+
+
+isrunning=0
+function get_status()
+{
+	str=`ps aux | grep -v "grep" | grep "\<$PROG\>"`
+	if [ -z "$str" ]
+	then
+		isrunning=0
+	else
+		isrunning=1
+	fi
+}
+
+get_status
+case "$1" in
+    start)
+        if [ $isrunning -eq 1 ]
+        then
+                echo "$PROG process is already running or crashed"
+        else
+                echo "Starting dmagent server..."
+                $EXEC $OPTIONS -c $CONF && echo "$PROG started successfully!"
+        fi
+        ;;
+    stop)
+        if [ $isrunning -eq 0 ]
+        then
+                echo "$PROG does not exist, process is not running"
+        else
+                echo "Stopping ..."
+				kill -9 `/sbin/pidof dmagent`
+				get_status
+				if [ $isrunning -eq 0 ]
+				then
+					echo "stop ${PROG} successfully!"
+				else
+					echo "stop ${PROG} failed!"
+				fi
+        fi
+        ;;
+    status)
+        if [ $isrunning -eq 0 ]
+        then
+        	echo "$PROG is not running"
+        else
+        	echo "$PROG is running"
+        fi
+        ;;
+    *)
+        echo "Please use $0 [start|stop|status] as first argument"
+        ;;
+esac

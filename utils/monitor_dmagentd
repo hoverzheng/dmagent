@@ -1,0 +1,88 @@
+#!/bin/bash
+#
+# start monitor_dmagent.sh script.
+#
+#
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# Source networking configuration.
+. /etc/sysconfig/network
+
+
+prog="monitor_dmagent"
+
+
+start()
+{
+	# start monitor_dmagent.sh
+
+	[ -x /usr/local/bin/$prog ] || exit 4
+    if [ -f /var/lock/subsys/$prog ]; then
+		echo "$prog is runninig!"
+		exit 0
+	fi
+
+	/usr/local/bin/$prog 1>/dev/null 2>&1 &
+    RETVAL=$?
+    [ $RETVAL -eq 0 ] && touch /var/lock/subsys/$prog
+	echo "start $prog successfully!"
+	return $RETVAL
+}
+
+stop()
+{
+	# stop monitor_dmagent.sh	
+	fpid=`ps aux | grep "/usr/local/bin/$prog" | grep -v 'grep' | awk '{print $2}'`
+	if [ -z "$fpid" ]; then
+		echo "$prog is not running"
+		exit 4
+	fi
+	echo "Shutting down $prog, pid is $fpid"
+	kill -9 $fpid
+    RETVAL=$?
+    [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/$prog
+	return $RETVAL
+}
+
+
+status()
+{
+	# show monitor_dmagent status
+
+	rets=`ps aux | /bin/grep "/usr/local/bin/$prog" | /bin/grep -v 'grep'`
+
+	if [ -z "$rets" ]
+	then
+		echo "$prog is not running!"
+	else
+		if [ -f /var/lock/subsys/$prog ]; then
+			echo "$prog is running!"
+		fi
+	fi
+}
+
+# See how we were called.
+case "$1" in
+  start)
+        start
+        ;;  
+  stop)
+        stop
+        ;;  
+  restart|reload)
+        stop
+        start
+        RETVAL=$?
+        ;;  
+  status)
+        status
+        RETVAL=$?
+        ;;  
+  *)  
+        echo $"Usage: $0 {start|stop|restart|status}"
+        exit 2
+esac
+
+exit $RETVAL

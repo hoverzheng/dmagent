@@ -112,7 +112,8 @@ int ketama_reset(ketama_continuum *contptr,serverinfo **slist,
 
 
 int delete_server_node(serverinfo **slist, unsigned int *numservers, 
-			unsigned long *memory, char *del_ip);
+			unsigned long *memory, serverinfo *psrv);
+			//unsigned long *memory, char *del_ip);
 
 int add_server_node(serverinfo **slist, unsigned int *numservers, 
 			unsigned long *memory, serverinfo *sri);

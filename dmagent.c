@@ -40,7 +40,8 @@ SUCH DAMAGE.
  * 2008-10-05, fix header file include under BSD systems
 
  * hover changlog
- * 2013-11-1,  changed ketama algorithm
+ * 2013-11-1,  changed ketama algorithm.
+ * 2013-11-20, add the function that delete node if the node is down or add node when the node restart automatically .
  */
 
 #define _GNU_SOURCE
@@ -80,160 +81,14 @@ SUCH DAMAGE.
 #include "ketama.h"
 #include "log.h"
 
+#include "common.h"
+#include "cqueue.h"
+#include "dmagent.h"
 
-#define VERSION "0.6"
-
-#define OUTOFCONN "SERVER_ERROR OUT OF CONNECTION"
-
-#define BUFFERLEN 2048
-#define MAX_TOKENS 8
-#define COMMAND_TOKEN 0
-#define KEY_TOKEN 1
-#define BYTES_TOKEN 4
-#define KEY_MAX_LENGTH 250
-#define BUFFER_PIECE_SIZE 16
-
-#define UNUSED(x) ( (void)(x) )
-#define STEP 5
-
-//zxh added 
-#define DEFAULT_PORT 11211
-#define CONN_CACHE_SIZE 1024
+// zxh added for buffer debug
+int total_buffers = 0;
+int total_buffer_size = 0;
 // end zxh
-
-/* structure definitions */
-typedef struct conn conn;
-typedef struct matrix matrix;
-typedef struct list list;
-typedef struct buffer buffer;
-typedef struct server server;
-
-// zxh added
-static void  ma_ltrim(register char *str, const char *charlist);
-
-// zxhadded
-typedef enum {
-	READ_SERVER,
-	READ_BACKUP,
-	READ_OTHERS
-} read_config_state;
-
-typedef enum {
-	CLIENT_COMMAND,
-	CLIENT_NREAD, /* MORE CLIENT DATA */
-	CLIENT_TRANSCATION
-} client_state_t;
-
-typedef enum {
-	SERVER_INIT,
-	SERVER_CONNECTING,
-	SERVER_CONNECTED,
-	SERVER_ERROR
-} server_state_t;
-
-struct buffer {
-	char *ptr;
-
-	size_t used;
-	size_t size;
-	size_t len; /* ptr length */
-
-	struct buffer *next;
-};
-
-/* list to buffers */
-struct list {
-	buffer *first;
-	buffer *last;
-};
-
-/* connection to memcached server */
-struct server {
-	int sfd;
-	server_state_t state;
-	struct event ev;
-	int ev_flags;
-	
-	matrix *owner;
-
-	/* first response line
-	 * NOT_FOUND\r\n
-	 * STORED\r\n
-	 */
-	char line[BUFFERLEN];
-	int pos;
-
-	/* get/gets key ....
-	 * VALUE <key> <flags> <bytes> [<cas unique>]\r\n 
-	 */
-	int valuebytes;
-	int has_response_header:1;
-	int remove_trail:1;
-
-	/* input buffer */
-	list *request;
-	/* output buffer */
-	list *response;
-
-	int pool_idx;
-};
-
-struct conn {
-	/* client part */
-	int cfd;
-	client_state_t state;
-	struct event ev;
-	int ev_flags;
-
-	/* command buffer */
-	char line[BUFFERLEN+1];
-	int pos;
-
-	int storebytes; /* bytes stored by CAS/SET/ADD/... command */
-
-	struct flag {
-		unsigned int is_get_cmd:1;
-		unsigned int is_gets_cmd:1;
-		unsigned int is_set_cmd:1;
-		unsigned int is_incr_decr_cmd:1;
-		unsigned int no_reply:1;
-		unsigned int is_update_cmd:1;
-		unsigned int is_backup:1;
-		unsigned int is_last_key:1;
-	} flag;
-
-	int keycount; /* GET/GETS multi keys */
-	int keyidx;
-	char **keys;
-
-	/* input buffer */
-	list *request;
-	/* output buffer */
-	list *response;
-
-	struct server *srv;
-};
-
-/* memcached server structure */
-struct matrix {
-	/*
-	char ip[IP_LEN];
-	int  weight;
-	int port;
-	*/
-	serverinfo s;
-	struct sockaddr_in dstaddr;
-
-	int size;
-	int used;
-	struct server **pool;
-};
-
-typedef struct token_s {
-	char *value;
-	size_t length;
-} token_t;
-
 
 /* static variables */
 static int port = 11211;
@@ -250,14 +105,18 @@ static int matrixcnt = 0;
 
 static struct matrix *backups= NULL; /* backup memcached server list */
 static int backupcnt = 0;
-static struct ketama *backupkt = NULL;
+//static struct ketama *backupkt = NULL;
 
 // zxh added for ketama algorithm
+// current ketama hash circle server list.
 static serverinfo **ktm_slist = NULL;
 static ketama_continuum ktm_kc = NULL;
 static int ktm_numservers; 
 extern int total_ktm_numservers; 
 static unsigned long ktm_memory;
+
+/* dead server circle queue. */
+static queue_t *dead_server_q;
 
 // conn cache, default size is 1024 struct conn pointer;
 //static int conn_caches_used;
@@ -282,8 +141,6 @@ time_t cur_ts;
 char cur_ts_str[128];
 
 
-
-
 //zxh added
 static int creat_ktm_slist(struct matrix *m, int nmt);
 
@@ -297,7 +154,8 @@ static void out_string(conn *, const char *);
 static void process_update_response(conn *);
 static void process_get_response(conn *, int);
 static void append_buffer_to_list(list *, buffer *);
-static void try_backup_server(conn *);
+//static void try_backup_server(conn *);
+static void dump(int signo);
 
 static void
 show_help(void)
@@ -308,7 +166,6 @@ show_help(void)
 		   "  -g gid\n"
 		   "  -c configure file name\n"
 		   "  -p port, default is 11211. (0 to disable tcp support)\n"
-		   //"  -s ip:port, set memcached server ip and port\n"
 		   "  -l ip, local bind ip address, default is 0.0.0.0\n"
 		   "  -n number, set max connections, default is 4096\n"
 		   "  -D don't go to background\n"
@@ -331,8 +188,63 @@ static void print_slist()
 	}
 }
 
+
 static int
 maintain_ketama_srv_worker(void)
+{
+	serverinfo *psrv;
+	int ret = OK;
+	char ip[32]={'\0'};
+	char *ps;
+	int i = 0;
+	int dead_server_n = dead_server_q->size;
+
+	if (ktm_numservers == 0) {
+		fprintf(stderr, "notice no availed server!\n");
+		sleep(1);
+		return OK;
+	} else {
+		if (verbose_mode) fprintf(stderr, "%d servers are available!\n", ktm_numservers);
+	}
+
+	for (i = 0; i < dead_server_n; i++) {
+		if (OK != dequeue(dead_server_q, &psrv)) {
+			if(verbose_mode) fprintf(stderr, "get dead server error!\n");
+			dmlog("get server from dead server queue error.");
+		}
+
+		/* zxh deleted. 2014-03-13
+		ps = NULL;
+		strncpy(ip, psrv->ip, 32);
+		ps = strchr(ip, ':');
+		if (ps) *ps = '\0';
+		*/
+		
+		if (!psrv->is_alive) continue; 					//this node is deleted
+		// zxh changed. 2014/3/13
+		//ret = delete_server_node(ktm_slist, &ktm_numservers, &ktm_memory, ip);
+		ret = delete_server_node(ktm_slist, &ktm_numservers, &ktm_memory, psrv);
+		if (FAIL == ret) {
+			//dmlog("delete server :%s error!\n", ip);
+			dmlog("delete server :%s error!\n", psrv->ip);
+			continue;
+		} 
+		if(verbose_mode)
+			fprintf(stderr, "delete server :%s ok, reset now!\n", psrv->ip);
+		ret = ketama_reset(&ktm_kc, ktm_slist, ktm_numservers, ktm_memory);
+		if (FAIL == ret) {
+			dmlog("reset ketama after deleted server :%s error!\n", psrv->ip);
+			continue;
+		} 
+		psrv->is_alive = FALSE;
+		dmlog("ip:%s is deleted successfully.", psrv->ip);
+	}
+	return OK;
+}
+
+
+static int
+maintain_ketama_srv_worker2(void)
 {
 	int sockfd;
 	struct sockaddr_in servaddr;
@@ -365,12 +277,15 @@ maintain_ketama_srv_worker(void)
 		ps = NULL;
 
 		servaddr.sin_family = AF_INET;
-		servaddr.sin_port = htons(DEFAULT_PORT);
-		strncpy(ip, psrv->ip, 32);
+		// zxh chang the default port to the port user set. 2014/3/13
+		//servaddr.sin_port = htons(DEFAULT_PORT);
+		servaddr.sin_port = htons(psrv->port);
+		strncpy(ip, psrv->ip, IP_LEN);
 		ps = strchr(ip, ':');
 		if (ps) *ps = '\0';
 		
-		if (verbose_mode) fprintf(stderr, "check ip =[%s], islive=%d\n", ip, psrv->is_alive);
+		if (verbose_mode) 
+			fprintf(stderr, "check ip =[%s] port=[%d], islive=%d\n", ip, psrv->port, psrv->is_alive);
 		if (inet_pton(AF_INET, ip, &servaddr.sin_addr) < 0) {
 			fprintf(stderr, "inet_pton error: %s\n", strerror(errno));
 			continue;
@@ -381,23 +296,24 @@ maintain_ketama_srv_worker(void)
 			if (errno != EINPROGRESS && errno != EALREADY) { 	//server is not available.
 				if (!psrv->is_alive) continue; 					//this node is deleted
 				if(verbose_mode)
-					fprintf(stderr, "connect to %s error\n", ip);
-				ret = delete_server_node(ktm_slist, &ktm_numservers, &ktm_memory, ip);
+					fprintf(stderr, "connect to %s error\n", psrv->ip);
+				ret = delete_server_node(ktm_slist, &ktm_numservers, &ktm_memory, psrv);
 				if (FAIL == ret) {
-					fprintf(stderr, "delete server :%s error!\n", ip);
+					fprintf(stderr, "delete server :%s error!\n", psrv->ip);
 					continue;
 				} 
 				if(verbose_mode)
-					fprintf(stderr, "delete server :%s ok, reset now!\n", ip);
+					fprintf(stderr, "delete server :%s ok, reset now!\n", psrv->ip);
 				ret = ketama_reset(&ktm_kc, ktm_slist, ktm_numservers, ktm_memory);
 				if (FAIL == ret) {
-					fprintf(stderr, "reset ketama after deleted server :%s error!\n", ip);
+					fprintf(stderr, "reset ketama after deleted server :%s error!\n", psrv->ip);
 					continue;
 				} 
 				psrv->is_alive = FALSE;
+				dmlog("ip:%s is deleted successfully.", psrv->ip);
 			}
 		} else {
-			fprintf(stderr, "connect to %s ok\n", ip);
+			fprintf(stderr, "connect to %s ok\n", psrv->ip);
 			close(sockfd);
 		}
 	}
@@ -429,8 +345,10 @@ maintain_ketama_srv_thread(void)
     	if (ketama_mantain_signal == 0) { 
     	    /* always hold this lock while we're running */
 			if (verbose_mode)
-				fprintf(stderr, "waiting for cond signal!\n");
+				fprintf(stderr, "waiting for cond signal 1111 now!\n");
     	    r = pthread_cond_wait(&ketama_mantain_cond, &ktm_lock);
+			if(verbose_mode)
+				fprintf(stderr, "waiting for cond signal 2222 now r=%d!\n", r);
     	}
 		//pthread_mutex_unlock(&ktm_lock);
 	}
@@ -453,12 +371,20 @@ maintain_add_srv_thread(void)
 	char ip[32]={'\0'};
 	char *ps;
 	int i = 0;
+	int fin_res = FAIL;
+	struct timeval tm;
+	fd_set set;
+	socklen_t len;
+	int error=-1;
+
+	/*
+     * initalize ketama server list
+     */
+	maintain_ketama_srv_worker2();
 
 	while (1) {
 		sleep(3); //every 2's check 
-
 		if (verbose_mode) fprintf(stderr, "matrixcnt=%d,ktm_numservers=%d\n", matrixcnt, ktm_numservers);
-
 		/*
 		if (matrixcnt == ktm_numservers) {
 			sleep(5);
@@ -466,59 +392,99 @@ maintain_add_srv_thread(void)
 			continue;
 		}
 		*/
-
 		for (i = 0; i < matrixcnt; i++) {
 			psrv = &(matrixs[i].s);
-			if (psrv->is_alive)		//here just deal with not alive host. 
+			if (psrv->is_alive)		/* here just deal with not alive host. */
 				continue;	
 
 			sockfd = socket(AF_INET, SOCK_STREAM, 0); 
 			if (sockfd < 0) {
-				dmlog("create socket error:%s\n",strerror(errno));
+				fprintf(stderr, "create socket error:%s\n",strerror(errno));
 				continue;
 			}
+			fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL)|O_NONBLOCK);
 
 			bzero(&servaddr, sizeof(servaddr));
 			bzero(ip, sizeof(ip));
 			ps = NULL;
 
 			servaddr.sin_family = AF_INET;
-			servaddr.sin_port = htons(DEFAULT_PORT);
-			strncpy(ip, psrv->ip, 32);
+			//servaddr.sin_port = htons(DEFAULT_PORT);
+			// zxh changed to use port user defined.
+			servaddr.sin_port = htons(psrv->port);
+			strncpy(ip, psrv->ip, IP_LEN);
 			ps = strchr(ip, ':');
 			if (ps) *ps = '\0';
 			
 			if (inet_pton(AF_INET, ip, &servaddr.sin_addr) < 0) {
-				dmlog("inet_pton error: %s\n", strerror(errno));
+				fprintf(stderr, "inet_pton error: %s\n", strerror(errno));
 				continue;
 			}
 			servlen = sizeof(servaddr);
 
-			if (-1 == connect(sockfd, (struct sockaddr *)&servaddr, servlen)) {
+			ret = connect(sockfd, (struct sockaddr *)&servaddr, servlen);
+			if (0 != ret) {
+				do {
+            		tm.tv_sec  = 0;
+            		tm.tv_usec = 500000; /* 500ms */
+            		FD_ZERO(&set);
+            		FD_SET(sockfd, &set);
+            		ret = select(sockfd+1, NULL, &set, NULL, &tm);
+
+            		if (0 == ret) { 	/* time out */
+            		    fin_res = FAIL;
+            		    break;
+            		}
+
+            		if(ret < 0 && errno != EINTR) { /* error happen */
+            		    fin_res = FAIL;
+            		    break;
+            		} else if (ret > 0) {
+            		    len = sizeof(int);
+            		    if(getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, (socklen_t *)&len) < 0) {
+            		        fin_res = FAIL;
+            		        break;
+            		    }
+            		    if(error != 0) { /* error happend in connect */
+            		        fin_res = FAIL;
+            		        break;
+            		    }
+            		    fin_res = OK;
+            		    break;
+            		} else { 	/* other error */
+            		    fin_res = FAIL;
+            		    break;
+            		}
+        		} while (1);
+			} else { 	/* the host can be available. */
+				fin_res = OK;
+			}
+
+			if (OK != fin_res) {
 				close(sockfd);
 				continue;
-			} else { //now this host can used.
-				if(verbose_mode)
-					fprintf(stderr, "connect to %s ok\n", ip);
-				pthread_mutex_lock(&ktm_lock);
-				ret = add_server_node(ktm_slist, &ktm_numservers, &ktm_memory, psrv);
-				if (FAIL == ret) {
-					dmlog("add server:[%s] to ktm_slist error!\n", ip);
-					pthread_mutex_unlock(&ktm_lock);
-					continue;
-				}
-				ret = ketama_reset(&ktm_kc, ktm_slist, ktm_numservers, ktm_memory);
-				//ketama_print_continuum(ktm_kc);
-				if (FAIL == ret) {
-					pthread_mutex_unlock(&ktm_lock);
-					dmlog("reset ketama after deleted server :%s error!\n", ip);
-					continue;
-				} 
-				psrv->is_alive = TRUE;
-				pthread_mutex_unlock(&ktm_lock);
-
-				close(sockfd);
 			}
+			
+			/* connect is ok */
+			if(verbose_mode) fprintf(stderr, "connect to %s ok\n", ip);
+			pthread_mutex_lock(&ktm_lock);
+			ret = add_server_node(ktm_slist, &ktm_numservers, &ktm_memory, psrv);
+			if (FAIL == ret) {
+				if (verbose_mode) fprintf(stderr,"add server:[%s] to ktm_slist error!\n", psrv->ip);
+				pthread_mutex_unlock(&ktm_lock);
+				continue;
+			}
+			ret = ketama_reset(&ktm_kc, ktm_slist, ktm_numservers, ktm_memory);
+			//ketama_print_continuum(ktm_kc);
+			if (FAIL == ret) {
+				pthread_mutex_unlock(&ktm_lock);
+				if (verbose_mode) fprintf(stderr, "reset ketama after added server :%s error!\n", ip);
+				continue;
+			} 
+			psrv->is_alive = TRUE;
+			dmlog("ip:%s is added successfully.", psrv->ip);
+			pthread_mutex_unlock(&ktm_lock);
+			close(sockfd);
 		}
 	}
 }
@@ -542,7 +508,7 @@ hashme(char *str)
 }
 
 static buffer *
-buffer_init_size(int size)
+buffer_init_size(int size, char *s)
 {
 	buffer *b;
 
@@ -559,17 +525,41 @@ buffer_init_size(int size)
 	}
 
 	b->len = size;
+	//zxh added for record
+	total_buffers++;
+	total_buffer_size += (size+sizeof(struct buffer));
+	strncpy(b->bname, s, 15);
+	#if 0
+	if (verbose_mode) {
+		//fprintf(stderr, "sizeof(buffer): %d, size=%d\n", sizeof(struct buffer), size);
+		printf("%s calloc: %d\n", b->bname, size+sizeof(struct buffer));
+	}
+	#endif
+	// end zxh
 	return b;
 }
 
+
+// zxh added for debug
 static void
-buffer_free(buffer *b)
+buffer_free(buffer *b, char *s)
 {
 	if (!b) return;
+
+	//zxh added for record
+	total_buffers--; 
+	total_buffer_size -= (b->len + sizeof(struct buffer));
+
+	#if 0
+	if (verbose_mode)	
+		printf("%s free: %d\n", b->bname, b->len+sizeof(struct buffer));
+	#endif
+	//end zxh
 
 	free(b->ptr);
 	free(b);
 }
+// end zxh
 
 static list *
 list_init(void)
@@ -590,7 +580,7 @@ list_free(list *l, int keep_list)
 	b = l->first;
 	while(b) {
 		n = b->next;
-		buffer_free(b);
+		buffer_free(b, "list");
 		b = n;
 	}
 
@@ -611,7 +601,7 @@ remove_finished_buffers(list *l)
 		if (b->used < b->size) /* incompleted buffer */
 			break;
 		n = b->next;
-		buffer_free(b);
+		buffer_free(b, "finish list");
 		b = n;
 	}
 
@@ -638,7 +628,7 @@ copy_list(list *src, list *dst)
 
 	if (size == 0) return;
 
-	r = buffer_init_size(size+1);
+	r = buffer_init_size(size+1, "copy_list");
 	if (r == NULL) return;
 
 	b = src->first;
@@ -728,7 +718,7 @@ tokenize_command(char *command, token_t *tokens, const size_t max_tokens)
 			s = e + 1;
 		}
 		else if (*e == '\0') {
-			if (s != e) {
+			if (s != e) { 	//the last command token
 				tokens[ntokens].value = s;
 				tokens[ntokens].length = e - s;
 				ntokens++;
@@ -834,7 +824,7 @@ put_server_into_pool(struct server *s)
 	if (m->size == 0) {
 		m->pool = (struct server **) calloc(sizeof(struct server *), STEP);
 		if (m->pool == NULL) {
-			dmlog("%s: (%s.%d) out of memory for pool allocation\n", cur_ts_str, __FILE__, __LINE__);
+			fprintf(stderr, "%s: (%s.%d) out of memory for pool allocation\n", cur_ts_str, __FILE__, __LINE__);
 			m = NULL;
 		} else {
 			m->size = STEP;
@@ -844,7 +834,7 @@ put_server_into_pool(struct server *s)
 		if (m->size < maxidle) {
 			p = (struct server **)realloc(m->pool, sizeof(struct server *)*(m->size + STEP));
 			if (p == NULL) {
-				dmlog("%s: (%s.%d) out of memory for pool reallocation\n", cur_ts_str, __FILE__, __LINE__);
+				fprintf(stderr, "%s: (%s.%d) out of memory for pool reallocation\n", cur_ts_str, __FILE__, __LINE__);
 				m = NULL;
 			} else {
 				m->pool = p;
@@ -895,26 +885,80 @@ server_error(conn *c, const char *s)
 	out_string(c, s);
 }
 
-/* return 0 if ok, return 1 if failed */
+
+/* 
+ * zxh added . 
+ * time out connect 
+ */
 static int
 socket_connect(struct server *s)
 {
 	socklen_t servlen;
+	int fin_res = 1;
+	struct timeval tm;
+    fd_set set;
+    fd_set rfds;
+	int ret = 1;
+	int error=-1, len;
 
 	if (s == NULL || s->sfd <= 0 || s->state != SERVER_INIT) return 1;
 
 	servlen = sizeof(s->owner->dstaddr);
-	if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
-		if (errno != EINPROGRESS && errno != EALREADY)
-			return 1;
-
-		s->state = SERVER_CONNECTING;
-	} else {
+	ret == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen);
+    if (0 == ret) {     /* ok */
+        fin_res = 0;
 		s->state = SERVER_CONNECTED;
-	}
+    } else if (ret < 0 && errno != EINPROGRESS && errno != EALREADY) {    /* error */
+        fin_res = 1;
+	} else { 			/* connect is in process. */
+        do {
+            tm.tv_sec  = 0;
+            tm.tv_usec = 200000; /* 200ms */
+            FD_ZERO(&set);
+            FD_SET(s->sfd, &set);
+            ret = select(s->sfd+1, NULL, &set, NULL, &tm);
 
-	return 0;
+            if (0 == ret) { 	/* time out */
+                fin_res = 1;
+                break;
+            }
+
+            if(ret < 0 && errno != EINTR) { /* error happen */
+                fin_res = 1;
+                break;
+            } else if (ret > 0) {
+                len = sizeof(int);
+                if(getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &error, (socklen_t *)&len) < 0) {
+                    fin_res = 1;
+                    break;
+                }
+
+                if(error != 0) { /* error happend in connect */
+                    fin_res = 1;
+                    break;
+                }
+
+                /* the connect is good */
+                fin_res = 0;
+				s->state = SERVER_CONNECTED;
+                break;
+            } else { 	/* other error */
+                fin_res = 1;
+                break;
+            }
+        } while (1);
+    }
+
+    if(0 != fin_res)
+    {
+        //close(s->sfd);
+        dmlog("Cannot Connect the server: !\n");
+    } 
+
+    return fin_res;
 }
+
+
 
 static void
 conn_close(conn *c)
@@ -1059,7 +1103,7 @@ out_string(conn *c, const char *str)
 	
 	len = strlen(str);
 
-	b = buffer_init_size(len + 3);
+	b = buffer_init_size(len + 3, "out_string");
 	if (b == NULL) return;
 
 	memcpy(b->ptr, str, len);
@@ -1107,101 +1151,6 @@ finish_transcation(conn *c)
 
 
 
-static void
-start_update_backupserver(conn *c)
-{
-	int size = 0, idx;
-	buffer *b, *r;
-	matrix *m;
-	server *s;
-
-	if (c == NULL) return;
-
-	if (c->flag.is_update_cmd == 0 || backupcnt == 0 || c->keycount != 1) return;
-
-	/* start backup set server now */
-	b = c->request->first;
-	while(b) {
-		size += b->size;
-		b = b->next;
-	}
-
-	if (size == 0) return;
-
-	r = buffer_init_size(size+1);
-	if (r == NULL) return;
-
-	b = c->request->first;
-	while(b) {
-		if (b->size > 0 ) {
-			memcpy(r->ptr + r->size, b->ptr, b->size);
-			r->size += b->size;
-		}
-		b = b->next;
-	}
-
-	if (use_ketama && backupkt) {
-		//idx = get_server(backupkt, c->keys[0]);
-		pthread_mutex_lock(&ktm_lock);
-		idx = ketama_get_server(c->keys[0], ktm_kc);
-		pthread_mutex_unlock(&ktm_lock);
-		if (idx < 0) {
-			/* fall back to round selection */
-			idx = hashme(c->keys[0])%backupcnt;
-		}
-	} else {
-		/* just round selection */
-		idx = hashme(c->keys[0])%backupcnt;
-	}
-
-	m = backups + idx;
-
-	if (m->pool && (m->used > 0)) {
-		s = m->pool[--m->used];
-		s->pool_idx = 0;
-		if (verbose_mode)
-			fprintf(stderr, "%s: (%s.%d) GET SERVER FD %d <- POOL\n", cur_ts_str, __FILE__, __LINE__, s->sfd);
-	} else {
-		s = (struct server *) calloc(sizeof(struct server), 1);
-		if (s == NULL) {
-			buffer_free(r);
-			return;
-		}
-		s->request = list_init();
-		s->response = list_init();
-		s->state = SERVER_INIT;
-	}
-	s->owner = m;
-
-	if (verbose_mode)
-		fprintf(stderr, "%s: (%s.%d) BACKUP KEY \"%s\" -> %s:%ld\n", 
-			cur_ts_str, __FILE__, __LINE__, c->keys[0], m->s.ip, m->s.port);
-
-	if (s->sfd <= 0) {
-		s->sfd = socket(AF_INET, SOCK_STREAM, 0); 
-		if (s->sfd < 0) {
-			fprintf(stderr, "%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
-			free(s);
-			buffer_free(r);
-			return;
-		}
-		fcntl(s->sfd, F_SETFL, fcntl(s->sfd, F_GETFL)|O_NONBLOCK);
-	}
-
-	append_buffer_to_list(s->request, r);
-
-	if (s->state == SERVER_INIT && socket_connect(s)) {
-		/* server error */
-		server_free(s);
-		return;
-	}
-
-	/* server event handler */
-	memset(&(s->ev), 0, sizeof(struct event));
-	event_set(&(s->ev), s->sfd, EV_PERSIST|EV_WRITE, drive_backup_server, (void *)s);
-	event_add(&(s->ev), 0);
-}
-
 
 /* start whole memcache agent transcation */
 static void
@@ -1231,7 +1180,7 @@ do_transcation(conn *c)
 
 	c->flag.is_backup = 0;
 	
-	if (c->flag.is_get_cmd) {
+	if (c->flag.is_get_cmd) { //是get命令,获取key的值
 		if (c->keyidx >= c->keycount) {
 			/* end of get transcation */
 			finish_transcation(c);
@@ -1240,10 +1189,16 @@ do_transcation(conn *c)
 		key = c->keys[c->keyidx++];
 		if (c->keyidx == c->keycount) c->flag.is_last_key = 1;
 	} else {
-		key = c->keys[0];
+		key = c->keys[0];  //获取key字段的值
 	}
 
 	pthread_mutex_lock(&ktm_lock);
+	if (0 == ktm_numservers) {
+		pthread_mutex_unlock(&ktm_lock);
+		if (verbose_mode) fprintf(stderr, "now available server is 0");
+		return;
+	}
+
 	idx = ketama_get_server(key, ktm_kc);
 	pthread_mutex_unlock(&ktm_lock);
 	if (idx < 0) {
@@ -1261,7 +1216,7 @@ do_transcation(conn *c)
 	} else {
 		s = (struct server *) calloc(sizeof(struct server), 1);
 		if (s == NULL) {
-			dmlog("%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			conn_close(c);
 			return;
 		}
@@ -1279,7 +1234,7 @@ do_transcation(conn *c)
 	if (s->sfd <= 0) {
 		s->sfd = socket(AF_INET, SOCK_STREAM, 0); 
 		if (s->sfd < 0) {
-			dmlog("%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
+			fprintf(stderr, "%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
 			return;
 		}
@@ -1295,17 +1250,17 @@ do_transcation(conn *c)
 	s->remove_trail = 0;
 	s->valuebytes = 0;
 
-	if (c->flag.is_get_cmd) {
-		b = buffer_init_size(strlen(key) + 20);
+	if (c->flag.is_get_cmd) { //若是get命令，创建一个buffer->ptr:"get <key>"，并把buffer添加到s->request队列中
+		b = buffer_init_size(strlen(key) + 20, "do_transcation-isgetcmd");
 		if (b == NULL) {
-			dmlog("%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR OUT OF MEMORY");
 			return;
 		}
 		b->size = snprintf(b->ptr, b->len - 1, "%s %s\r\n", c->flag.is_gets_cmd?"gets":"get", key);
 		append_buffer_to_list(s->request, b);
-	} else {
-		copy_list(c->request, s->request);
+	} else { //若是set等命令，则把c->request命令行队列复制到s->request队列中
+		copy_list(c->request, s->request); //set... command. copy client request to backend memcached server.
 	}
 
 	c->state = CLIENT_TRANSCATION;
@@ -1326,6 +1281,9 @@ do_transcation(conn *c)
 		pthread_mutex_lock(&ktm_lock);
 		if(verbose_mode)
 			fprintf(stderr, "signal to reset ketama!\n");
+		if (ERROR == enqueue(dead_server_q, &(s->owner->s)))
+			dmlog("enqueue dead server: %s into dead server queue error!", s->owner->s.ip);
+
 		ketama_mantain_signal = 1;
     	pthread_cond_signal(&ketama_mantain_cond);
 		pthread_mutex_unlock(&ktm_lock);
@@ -1400,6 +1358,9 @@ drive_memcached_server(const int fd, const short which, void *arg)
 				pthread_mutex_lock(&ktm_lock);
 				if (verbose_mode) 
 					fprintf(stderr, "signal to reset ketama! in %s:%d\n", __FILE__, __LINE__);
+				if (ERROR == enqueue(dead_server_q, &(s->owner->s)))
+					dmlog("enqueue server: %s into dead server queue error!", s->owner->s.ip);
+
 				ketama_mantain_signal = 1;
     			pthread_cond_signal(&ketama_mantain_cond);
 				pthread_mutex_unlock(&ktm_lock);
@@ -1447,7 +1408,7 @@ drive_memcached_server(const int fd, const short which, void *arg)
 	
 	if (!(which & EV_READ)) return;
    
-	/* get the byte counts of read */
+	/* get the byte counts of read */ //从server读取数据,s->stats的值为EV_READ
 	if (ioctl(s->sfd, FIONREAD, &toread) || toread == 0) {
 		//if (backupcnt > 0)
 			//try_backup_server(c);
@@ -1456,7 +1417,7 @@ drive_memcached_server(const int fd, const short which, void *arg)
 		return;
 	}
 
-	if (c->flag.is_get_cmd) {
+	if (c->flag.is_get_cmd) { //是get命令
 		if (s->has_response_header == 0) {
 			/* NO RESPONSE HEADER */
 			if (toread > (BUFFERLEN - s->pos))
@@ -1522,7 +1483,7 @@ process_get_response(conn *c, int r)
 			if (p) {
 				p = strchr(p + 1, ' ');
 				if (p) {
-					s->valuebytes = atol(p+1);
+					s->valuebytes = atol(p+1);  //获取返回的bytes数
 					//if (s->valuebytes < 0) {
 					//	try_backup_server(c); /* conn_close(c); */
 					//}
@@ -1530,7 +1491,7 @@ process_get_response(conn *c, int r)
 			}
 		}
 
-		if (s->valuebytes < 0) {
+		if (s->valuebytes < 0) { //服务器返回的bytes数小于0，出错
 			/* END\r\n or SERVER_ERROR\r\n
 			 * just skip this transcation
 			 */
@@ -1540,9 +1501,9 @@ process_get_response(conn *c, int r)
 			do_transcation(c); /* TO Next KEY */
 			return;
 		}
-		s->valuebytes += 7; /* trailing \r\nEND\r\n */
+		s->valuebytes += 7; /* trailing \r\nEND\r\n */  //返回的值需要添加末尾的end字符
 
-		b = buffer_init_size(pos + 1);
+		b = buffer_init_size(pos + 1, "SAVE_VALUE"); //创建buffer,保存VALUE行的值，不包括数据段
 		if (b == NULL) {
 			if (verbose_mode)
 				fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", 
@@ -1550,13 +1511,13 @@ process_get_response(conn *c, int r)
 			//try_backup_server(c); /* conn_close(c); */
 			return;
 		}
-		memcpy(b->ptr, s->line, pos);
+		memcpy(b->ptr, s->line, pos); //把VALUE的结果行字符串复制到buffer中
 		b->size = pos;
-		append_buffer_to_list(s->response, b);
+		append_buffer_to_list(s->response, b);  //把结果buffer复制到server的response链表中
 
-		if (s->pos > pos) {
-			memmove(s->line, s->line + pos, s->pos - pos);
-			s->pos -= pos;
+		if (s->pos > pos) { //s->pos是包括数据段的返回数据最后的位置
+			memmove(s->line, s->line + pos, s->pos - pos);  //把数据段移动到s->line的开始位置处，覆盖掉原来的返回命令行
+			s->pos -= pos;	//s->pos减去pos长度
 		} else {
 			s->pos = 0;
 		}
@@ -1571,7 +1532,7 @@ process_get_response(conn *c, int r)
 	if (s->remove_trail) {
 		s->pos = 0;
 	} else if (s->pos > 0) {
-		b = buffer_init_size(s->pos+1);
+		b = buffer_init_size(s->pos+1, "get_response");
 		if (b == NULL) {
 			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			//try_backup_server(c); /* conn_close(c); */
@@ -1595,7 +1556,7 @@ process_get_response(conn *c, int r)
 		put_server_into_pool(s);
 		c->srv = NULL;
 		if (c->flag.is_last_key) {
-			b = buffer_init_size(6);
+			b = buffer_init_size(6, "get_response-lastkey");
 			if (b) {
 				memcpy(b->ptr, "END\r\n", 5);
 				b->size = 5;
@@ -1641,7 +1602,7 @@ process_update_response(conn *c)
 	/* found \n */
 	pos ++;
 
-	b = buffer_init_size(pos + 1);
+	b = buffer_init_size(pos + 1, "update_response");
 	if (b == NULL) {
 		dmlog("%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 		server_error(c, "SERVER_ERROR OUT OF MEMORY");
@@ -1786,14 +1747,14 @@ process_command(conn *c)
 	if (p == NULL) return;
 
 	len = p - c->line;
-	*p = '\0'; /* remove \n */
+	*p = '\0'; /* remove \n */ //p此时指向命令行的结尾，注意不包括后面的数据段
 	if (*(p-1) == '\r') {
 		*(p-1) = '\0'; /* remove \r */
-		len --;
+		len --;		//len的长度是命令行的长度，不包括数据
 	}
 
-	/* backup command line buffer first */
-	b = buffer_init_size(len + 3);
+	/* backup command line buffer first */ 	//把不包括数据段的命令行保存到buffer结构中
+	b = buffer_init_size(len + 3, "backupcommand");
 	memcpy(b->ptr, c->line, len);
 	b->ptr[len] = '\r';
 	b->ptr[len+1] = '\n';
@@ -1801,15 +1762,17 @@ process_command(conn *c)
 	b->size = len + 2;
 
 #if 0
-	if (verbose_mode)
+	if (verbose_mode) {
+		fprintf(stderr, "zxhdebug: backupcommand=[%s]\n", b->ptr);
 		fprintf(stderr, "%s: (%s.%d) PROCESSING COMMAND: %s", cur_ts_str, __FILE__, __LINE__, b->ptr);
+	}
 #endif
 
 	memset(&(c->flag), 0, sizeof(c->flag));
 	c->flag.is_update_cmd = 1;
 	c->storebytes = c->keyidx = 0;
 
-	ntokens = tokenize_command(c->line, tokens, MAX_TOKENS);
+	ntokens = tokenize_command(c->line, tokens, MAX_TOKENS); //把line中的字符串(只是命令行，不包括数据)拆成几段，把位置分别保存在token.value中
 	if (ntokens >= 3 && (
 			(strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
 			(strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)
@@ -1828,7 +1791,7 @@ process_command(conn *c)
 			out_string(c, "SERVER_ERROR OUT OF MEMORY");
 			skip = 1;
 		} else {
-			if (ntokens < MAX_TOKENS) {
+			if (ntokens < MAX_TOKENS) { //把line中的命令字段，保存到c->keys中
 				for (i = KEY_TOKEN, j = 0; (i < ntokens) && (j < c->keycount); i ++, j ++)
 					c->keys[j] = strdup(tokens[i].value);
 			} else {
@@ -1915,8 +1878,8 @@ process_command(conn *c)
 		 * "NOT_FOUND\r\n" to indicate that the item you are trying to store
 		 */
 		c->flag.is_set_cmd = 1;
-		c->storebytes = atol(tokens[BYTES_TOKEN].value);
-		c->storebytes += 2; /* \r\n */
+		c->storebytes = atol(tokens[BYTES_TOKEN].value); //获取数据段长度值
+		c->storebytes += 2; /* \r\n */ //数据长度字段还包括\r\n这两个字段
 	} else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
 		/* END\r\n
 		 */
@@ -1931,14 +1894,23 @@ process_command(conn *c)
 		*/
 		char tmp[512];
 
-		snprintf(tmp, sizeof(tmp), "total hash servers: %d\n current available servers: %d", 
+		//zxh added static variable. 2014-03-17
+		snprintf(tmp, sizeof(tmp), "current total connects: %d\n", curconns);
+		out_string(c, tmp);
+
+		// added buffer statistic
+		snprintf(tmp, sizeof(tmp), "buffers: %d, buffersize=%d\n", total_buffers, total_buffer_size);
+		out_string(c, tmp);
+		// end zxh
+
+		snprintf(tmp, sizeof(tmp), "total servers: %d\n current available servers: %d", 
 			total_ktm_numservers, ktm_numservers);
 		out_string(c, tmp);
 
-		for (i = 0; i < ktm_numservers; i++) {
+		for (i = 0; i < total_ktm_numservers; i++) {
 			if (NULL != *(ktm_slist+i)) {
-				snprintf(tmp, sizeof(tmp), "ip: %s, weight:%ld", 
-					(*(ktm_slist+i))->ip, (*(ktm_slist+i))->weight);
+				snprintf(tmp, sizeof(tmp), "ip:port->%s:%d, weight:%ld", 
+					(*(ktm_slist+i))->ip, (*(ktm_slist+i))->port, (*(ktm_slist+i))->weight);
 				out_string(c, tmp);
 			}
 		}
@@ -1947,6 +1919,9 @@ process_command(conn *c)
 		skip = 1;
 	} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
 		conn_close(c);
+		// zxh added for bug: memory leak. 2014-03-19
+		buffer_free(b, "backupcommand");
+		// end zxh
 		return;
 	} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
 		out_string(c, "VERSION memcached agent v" VERSION);
@@ -1959,9 +1934,9 @@ process_command(conn *c)
 	/* finish process commands */
 	if (skip == 0) {
 		/* append buffer to list */
-		append_buffer_to_list(c->request, b);
+		append_buffer_to_list(c->request, b); //把命令行buffer复制到c->request中
 
-		if (c->flag.is_get_cmd == 0) {
+		if (c->flag.is_get_cmd == 0) { //非get命令
 			if (tokens[ntokens-2].value && strcmp(tokens[ntokens-2].value, "noreply") == 0)
 				c->flag.no_reply = 1;
 			c->keycount = 1;
@@ -1975,37 +1950,37 @@ process_command(conn *c)
 			c->keys[0] = strdup(tokens[KEY_TOKEN].value);
 		}
 	} else {
-		buffer_free(b);
+		buffer_free(b, "backupcommand");
 	}
 
-	i = p - c->line + 1;
-	if (i < c->pos) {
-		memmove(c->line, p+1, c->pos - i);
-		c->pos -= i;
+	i = p - c->line + 1;  //这里是i计算出来的是命令行字符串的长度
+	if (i < c->pos) { //c->pos是整个接收的数据包的长度最后位置
+		memmove(c->line, p+1, c->pos - i); //把数据段移动到c->line的开始位置
+		c->pos -= i;	//把c->pos的值移动到数据段的开始位置,若没有数据段,此时c->pos的值是数据段的长度
 	} else {
-		c->pos = 0;
+		c->pos = 0;		//若没有数据段，则为0
 	}
 
-	if (c->storebytes > 0) {
-		if (c->pos > 0) {
-			/* append more buffer to list */
-			b = buffer_init_size(c->pos + 1);
+	if (c->storebytes > 0) {  //是set命令
+		if (c->pos > 0) { //此时pos指向数据段的开始位置，若存在数据段
+			/* append more buffer to list */ //data content and data length
+			b = buffer_init_size(c->pos + 1, "setcmd_datalen");  //创建buffer结构,长度是数据段的长度
 			if (b == NULL) {
 				fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 				conn_close(c);
 				return;
 			}
-			memcpy(b->ptr, c->line, c->pos);
+			memcpy(b->ptr, c->line, c->pos);  //把数据段的数据复制到buffer的ptr中
 			b->size = c->pos;
-			c->storebytes -= b->size;
-			append_buffer_to_list(c->request, b);
-			c->pos = 0;
+			c->storebytes -= b->size;		// 存储数据长度减去c->pos，若数据已经读完了，storebytes应该为0
+			append_buffer_to_list(c->request, b); //把数据段buffer复制到c->request中
+			c->pos = 0;						//c->pos指向0的位置
 		}
-		if (c->storebytes > 0)
+		if (c->storebytes > 0) 			//data is not complete, have some data to read.
 			c->state = CLIENT_NREAD;
 		else
-			start_magent_transcation(c);
-	} else {
+			start_magent_transcation(c);  //数据和命令都已经处理完毕，开始传输命令和数据
+	} else { //若是get命令,且没有出错
 		if (skip == 0)
 			start_magent_transcation(c);
 	}
@@ -2055,7 +2030,7 @@ drive_client(const int fd, const short which, void *arg)
 
 			if (toread > c->storebytes) toread = c->storebytes;
 
-			b = buffer_init_size(toread + 1);
+			b = buffer_init_size(toread + 1, "drive_client_NREAD");
 			if (b == NULL) {
 				fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 				dmlog("%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
@@ -2065,7 +2040,7 @@ drive_client(const int fd, const short which, void *arg)
 
 			r = read(c->cfd, b->ptr, toread);
 			if ((r <= 0) && (errno != EINTR && errno != EAGAIN))  {
-				buffer_free(b);
+				buffer_free(b, "drive client read");
 				conn_close(c);
 				return;
 			}
@@ -2111,12 +2086,22 @@ server_accept(const int fd, const short which, void *arg)
 	UNUSED(which);
 
 	memset(&s_in, 0, len);
+
 	newfd = accept(fd, (struct sockaddr *) &s_in, &len);
 	if (newfd < 0) {
 		fprintf(stderr, "%s: (%s.%d) ACCEPT() FAILED\n", cur_ts_str, __FILE__, __LINE__);
 		dmlog("%s: (%s.%d) ACCEPT() FAILED\n", cur_ts_str, __FILE__, __LINE__);
 		return ;
 	}
+
+	// zxh added for if no host is alive, return immediately. 2014/3/12
+	if (ktm_numservers <= 0) {
+		dmlog("Alert: all memcached cluster hosts are down.\n");
+		write(newfd, NONEALIVE, sizeof(NONEALIVE));
+		close(newfd);
+		return;
+	}
+	// end zxh
 
 	if (curconns >= maxconns) {
 		/* out of connections */
@@ -2308,7 +2293,7 @@ static int read_server_list(char *line)
 		matrixcnt ++;
 	}
 
-	ma_ltrim(ps, "\t ");
+	dm_ltrim(ps, "\t ");
 	pv = strchr(ps, ':');	
 	if (NULL == pv)
 		goto error;
@@ -2321,12 +2306,12 @@ static int read_server_list(char *line)
 	if (NULL == pv) goto error;
 	*pv++ =  '\0';
 	m->s.port = atoi(ps);
-	if (m->s.port <= 0) m->s.port = 11211;
+	if (m->s.port <= 0) m->s.port = DEFAULT_PORT;
 
 	// add weight 
-	ma_ltrim(pv, " \t");
+	dm_ltrim(pv, " \t");
 	m->s.weight = atoi(pv);
-	if (m->s.weight <= 0) m->s.weight = 1; //default weight
+	if (m->s.weight <= 0) m->s.weight = 10; //default weight
 	m->s.is_alive = TRUE;
 
 	// for socket
@@ -2353,7 +2338,6 @@ static int creat_ktm_slist(struct matrix *m, int nmt)
 
 	ktm_slist = (serverinfo **) calloc(nmt, sizeof(serverinfo *));
 	if (ktm_slist == NULL) {
-		dmlog("out of memory for %s\n", optarg);
 		fprintf(stderr, "out of memory for %s\n", optarg);
 		return FAIL;
 	}
@@ -2363,6 +2347,8 @@ static int creat_ktm_slist(struct matrix *m, int nmt)
 		ktm_slist[ktm_numservers] = &(m[i].s);
 		ktm_memory += ktm_slist[ktm_numservers]->weight;
 		ktm_numservers ++;
+		if(verbose_mode)
+			fprintf(stderr, "add server ip=[%s], port=[%d], weight=[%d]\n", m[i].s.ip, m[i].s.port,m[i].s.weight);
 	}
 	
 	total_ktm_numservers = ktm_numservers;
@@ -2374,7 +2360,7 @@ static int creat_ktm_slist(struct matrix *m, int nmt)
  * delete prev chars before real value.
  */
 static void  
-ma_ltrim(register char *str, const char *charlist)
+dm_ltrim(register char *str, const char *charlist)
 {
     register char *p;
 
@@ -2400,7 +2386,7 @@ ma_ltrim(register char *str, const char *charlist)
  * 
  */
 static void 
-ma_rtrim(char *str, const char *charlist)
+dm_rtrim(char *str, const char *charlist)
 {
     register char *p;
 
@@ -2439,11 +2425,12 @@ read_config(char *filename)
 		exit(1);
 	}
 	while (fgets(buffer, LLEN, fp)) {
+		buffer[LLEN-1] = '\0';
 		if (buffer[0] == '#') continue; //comment
 		ps = buffer;
-		ma_ltrim(ps, "\t \n#");
+		dm_ltrim(ps, "\t \n#");
 		if (*ps == '#') continue;		//comment
-		ma_rtrim(ps, "\t\n ");
+		dm_rtrim(ps, "\t\n ");
 
 		if (*ps == '[') {
 			if (!strncmp(ps,"[server]",strlen("[server]"))) {
@@ -2501,7 +2488,6 @@ main(int argc, char **argv)
 	int uid, gid, todaemon = 1, flags = 1, c;
 	struct sockaddr_in server;
 	struct linger ling = {0, 0};
-	//struct matrix *m; 
 	struct timeval tv;
 	
 	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:f:i:c:"))) {
@@ -2563,6 +2549,13 @@ main(int argc, char **argv)
 		}
 	}
 
+	// zxh added ignore SIGPIPE signal. 2014-4-30
+	signal(SIGPIPE, SIG_IGN);
+
+	signal(SIGTERM, server_exit);
+	signal(SIGINT, server_exit);
+	signal(SIGSEGV, &dump);
+
 	if (matrixcnt == 0) {
 		fprintf(stderr, "please provide -s \"ip:port\" argument\n\n");
 		show_help();
@@ -2585,6 +2578,12 @@ main(int argc, char **argv)
 	if (use_ketama) {
 		// zxh added for use ketama algorithm.
 		pthread_mutex_lock(&ktm_lock);
+		dead_server_q = create_queue(matrixcnt);
+		if (NULL == dead_server_q) {
+			fprintf(stderr, "init dead server queue error!\n");
+			exit(1);
+		}
+
 		if (OK != ketama_reset(&ktm_kc, ktm_slist, ktm_numservers, ktm_memory)) {
 			fprintf(stderr, "init ketama error!\n");
 			exit(1);
@@ -2630,18 +2629,17 @@ main(int argc, char **argv)
 
 	}
 
-	pthread_t ptid;
-	pthread_t add_pid;
-	// create maintain ketama server list thread
-	pthread_create(&ptid, NULL, (void *)&maintain_ketama_srv_thread, NULL);
-	// add maintain
-	pthread_create(&add_pid, NULL, (void *)&maintain_add_srv_thread, NULL);
 
 	if (socketpath) 
 		server_socket_unix();
 
-	signal(SIGTERM, server_exit);
-	signal(SIGINT, server_exit);
+
+	pthread_t ptid;
+	pthread_t add_pid;
+	// create maintain ketama server list thread
+	pthread_create(&ptid, NULL, (void *)&maintain_ketama_srv_thread, NULL);
+	// maintain server list when server restart
+	pthread_create(&add_pid, NULL, (void *)&maintain_add_srv_thread, NULL);
 
 	event_init();
 
@@ -2666,4 +2664,28 @@ main(int argc, char **argv)
 	event_loop(0);
 	server_exit(0);
 	return 0;
+}
+
+
+/* 
+ * dump the stack when recieved signo 
+ */
+static void dump(int signo)
+{
+    void *array[10];
+    size_t size;
+    char **strings;
+    size_t i;
+
+    size = backtrace (array, 10);
+    strings = backtrace_symbols (array, size);
+
+    fprintf(stderr, "Obtained %zd stack frames.\n", size);
+
+    for (i = 0; i < size; i++)
+            fprintf(stderr, "%s\n", strings[i]);
+
+    free (strings);
+
+    exit(0);
 }

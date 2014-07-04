@@ -30,11 +30,12 @@
 #include <sys/shm.h>        /* shared memory functions and structs  */
 #include <stdlib.h>
 
+// zxh added for use tc_malloc
+#include "common.h"
+
+
 //#ifdef __cplusplus  extern "C"{ #endif
 
-#define OK 0
-#define FAIL -1
-#define ERROR -1
 
 extern int verbose_mode;
 
@@ -328,7 +329,7 @@ ketama_create_continuum( key_t key, char* filename )
         for( i = 0; i < numservers; i++ )
         {
         float pct = (float)slist[i].weight / (float)memory;
-        int hpct = floorf( pct * 100.0 );
+        //int hpct = floorf( pct * 100.0 );
         int ks = floorf( pct * 40.0 * (float)numservers );
 
 //         syslog( LOG_INFO, "Server no. %d: %s (mem: %d = %d%% or %d of %d)\n", i, slist[i].addr,
@@ -517,9 +518,8 @@ ketama_create_prepare(ketama_continuum kcptr, serverinfo **slist,
         int hpct = floorf( pct * 100.0 );						//整数权重值
         int ks = floorf( pct * 40.0 * (float)numservers );
 
-		if (verbose_mode)
-			fprintf(stderr, "Server no. %d: %s (mem: %ld = %d%% or %d of %d)\n", i, slist[i]->ip,
-				slist[i]->weight, hpct, ks, numservers * 40 );
+		fprintf(stderr, "Server no. %d: %s (mem: %ld = %d%% or %d of %d)\n", i, slist[i]->ip,
+			slist[i]->weight, hpct, ks, numservers * 40 );
 
 		for( k = 0; k < ks; k++ ) {
 			// 40 hashes, 4 numbers per hash = 160 points per server
@@ -546,7 +546,7 @@ ketama_create_prepare(ketama_continuum kcptr, serverinfo **slist,
 	// sorts in ascending order of "point"
     qsort( (void*) &continuum, cont, sizeof( mcs ), (compfn)ketama_compare );
 
-	int nump = cont;
+	//int nump = cont;
 	mcs *mptr = NULL;	
 
 	kcptr->nsrv = numservers;
@@ -555,6 +555,7 @@ ketama_create_prepare(ketama_continuum kcptr, serverinfo **slist,
 	//} else if (kcptr->numpoints < cont) {
 	} else {
 		free(kcptr->array);
+		kcptr->array = NULL;
 		mptr = (mcs *)calloc(cont, sizeof(mcs));
 		if (mptr)
 			kcptr->array = mptr;
@@ -576,10 +577,9 @@ ketama_create_prepare(ketama_continuum kcptr, serverinfo **slist,
 int ketama_reset(ketama_continuum *contptr,serverinfo **slist, 
 				unsigned int numservers, unsigned long memory)
 {
-    if ( numservers < 1 ) {
-		if (verbose_mode)
-			fprintf(stderr, "number of server < 1!\n");
-        return ERROR;
+    if ( numservers == 0 ) {
+		fprintf(stderr, "number of server < 1!\n");
+        return OK;
 	}
 
 	if (NULL == *contptr) {
@@ -597,22 +597,29 @@ int ketama_reset(ketama_continuum *contptr,serverinfo **slist,
  * delete an ip from slist.
  */
 int delete_server_node(serverinfo **slist, unsigned int *numservers, 
-			unsigned long *memory, char *del_ip)
+			unsigned long *memory, serverinfo *psrv)
+			//unsigned long *memory, char *del_ip)
 {
 	int i;
 	unsigned long del_mem;
 
-	if (!slist || !*numservers || !del_ip)		
+	if (0 == *numservers)
+		return OK;
+
+	if (!slist || !*numservers || !psrv)		
 		return FAIL;
 
 	//for (i = 0; i < *numservers; i++) {
 	for (i = 0; i < total_ktm_numservers; i++) {
 		if (slist[i] == NULL)
 			continue;
-
-		if (!strncmp(slist[i]->ip, del_ip, IP_LEN)) {
-			if (verbose_mode)
-				fprintf(stderr, "delete matched!slistip=[%s],del_ip=[%s]\n", slist[i]->ip, del_ip);
+		if (verbose_mode)
+			fprintf(stderr, "delete matched!slistip=[%s],del_ip=[%s]\n", slist[i]->ip, psrv->ip);
+		// zxh changed to psrv. 2014-03-13
+		//if (!strncmp(slist[i]->ip, psrv->ip, IP_LEN)) {
+		if ((!strncmp(slist[i]->ip, psrv->ip, IP_LEN)) && (slist[i]->port == psrv->port)) {
+			if(verbose_mode)	
+				fprintf(stderr, "delete matched ip\n");
 			del_mem = slist[i]->weight;	
 			/*
 			for (j = i; j < *numservers-1; j++) {
@@ -620,7 +627,7 @@ int delete_server_node(serverinfo **slist, unsigned int *numservers,
 			}
 			*/
 			// here can do it better
-			*(slist+i) = NULL; //just set NULL
+			*(slist+i) = NULL;  /* just set NULL */
 			*memory -= del_mem;
 			*numservers -= 1;
 		}
@@ -645,9 +652,10 @@ int add_server_node(serverinfo **slist, unsigned int *numservers,
 
 	for (i = 0; i < total_ktm_numservers; i++) {
 		if (NULL != *(slist+i)) {
+			fprintf(stderr, "i=%d\n", i);
 			continue;
 		}
-		if (verbose_mode)
+		if(verbose_mode)
 			fprintf(stderr, "find empty seat in ktmserver list: %d  add server=[%s]\n", i, sri->ip);
 
 		*(slist+i) = sri;
