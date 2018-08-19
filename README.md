@@ -28,7 +28,9 @@ dmagent
 
 ## 使用说明
 ### 编译
+```
 $ make
 $ ./dmagent
+```
 
 ## 通过memcached的客户就可以连接使用
