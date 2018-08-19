@@ -17,20 +17,25 @@ dmagent
 * 使用了tc_malloc作为内存管理模块，减少内存碎片，提高了软件性能。
 
 ## 使用架构
+
 ```
-[dmagent]----->memcached1
-       |
-       -------->memcached2
-       |
-       -------->memcached3
-       ...
+[memcached client]<---->[dmagent]+<-------->memcached1
+                                 |
+                                 +<-------->memcached2
+                                 |
+                                 +<-------->memcached3
+                                 | ...
 ```       
 
 ## 使用说明
 ### 编译
 ```
 $ make
-$ ./dmagent -f magent.conf
+$ ./dmagent -c magent.conf
 ```
 
-## 通过memcached的客户就可以连接使用
+### 配置说明
+配置端口和后端各个memcached服务的权重。
+
+### 使用
+通过memcached的客户连接使用。
