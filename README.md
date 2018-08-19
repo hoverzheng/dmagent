@@ -17,13 +17,14 @@ dmagent
 * 使用了tc_malloc作为内存管理模块，减少内存碎片，提高了软件性能。
 
 ## 使用架构
+```
 [dmagent]----->memcached1
        |
        -------->memcached2
        |
        -------->memcached3
        ...
-       
+```       
 
 ## 使用说明
 ### 编译
