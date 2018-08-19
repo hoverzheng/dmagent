@@ -30,7 +30,7 @@ dmagent
 ### 编译
 ```
 $ make
-$ ./dmagent
+$ ./dmagent -f magent.conf
 ```
 
 ## 通过memcached的客户就可以连接使用
